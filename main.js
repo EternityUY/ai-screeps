@@ -1364,18 +1364,16 @@ const RoadPlanner = {
     if (Game.time - Memory._lastRoadPlan < 200) return;  // 每 200t 一次
     Memory._lastRoadPlan = Game.time;
 
-    // 构建 CostMatrix：已有道路低成本，墙/路障不可通行
+    // 构建 CostMatrix：已有道路低成本，墙不可通行，建筑不可通行
     const costs = new PathFinder.CostMatrix();
     for (const road of cache.roads)
       costs.set(road.pos.x, road.pos.y, 1);
     for (const s of cache.walls)
       costs.set(s.pos.x, s.pos.y, 255);
-    for (const s of cache.ramparts)
-      costs.set(s.pos.x, s.pos.y, 255);
-    // 已有建筑不可通行（避免路径穿墙）
+    // 已有建筑不可通行（Containers/Ramparts 可穿越，不阻塞）
     for (const s of cache.myStructures) {
       if (s.structureType !== STRUCTURE_ROAD && s.structureType !== STRUCTURE_CONTAINER
-        && s.structureType !== STRUCTURE_RAMPART)
+        && s.structureType !== STRUCTURE_RAMPART && s.structureType !== STRUCTURE_WALL)
         costs.set(s.pos.x, s.pos.y, 255);
     }
 
@@ -1398,7 +1396,7 @@ const RoadPlanner = {
         const hasSite = cache.sites.some(s => s.pos.x === pos.x && s.pos.y === pos.y);
         const hasRoad = cache.roads.some(s => s.pos.x === pos.x && s.pos.y === pos.y);
         const hasStructure = cache.myStructures.some(s => s.pos.x === pos.x && s.pos.y === pos.y
-          && s.structureType !== STRUCTURE_CONTAINER);
+          && s.structureType !== STRUCTURE_CONTAINER && s.structureType !== STRUCTURE_RAMPART);
         if (hasSite || hasRoad || hasStructure) continue;
         if (terrain.get(pos.x, pos.y) === TERRAIN_MASK_WALL) continue;
 
