@@ -1273,9 +1273,8 @@ const StatsTracker = {
     return Math.round((a.spawning / a.ticks) * 100);
   },
 
-  /** 能量日志原始数据 (用于 sparkline) */
-  energyLog() { return Memory.stats?.energyLog || []; },
 };
+
 
 // ============================================================
 //  SECTION: VIS_CONFIG — 可视化 Flag 开关
@@ -1327,7 +1326,7 @@ const Visuals = {
     if (level === 1) return;
 
     // level 2+ : 完整可视化
-    this._sparkline(v, cache);
+    this._phasePanel(v, cache);
     this._energyFlow(v, cache);
     this._controllerBar(v, cache);
     this._constructionBars(v, cache);
@@ -1414,56 +1413,163 @@ const Visuals = {
     }
   },
 
-  // ---- 能量趋势 Sparkline ----
-  _sparkline(v, cache) {
-    const log = StatsTracker.energyLog();
-    if (!log || log.length < 5) return;
+  // ---- 阶段面板 (替代原 Sparkline) ----
+  _phasePanel(v, cache) {
+    const hr = Helpers.getHomeRoom();
+    const counts = Helpers.countCreepsByRole(hr);
+    const rcl = cache.rcl;
 
-    // 画在面板右边
-    const bx = 20, by = 1.5;
-    const w = 6, h = 2.5;
-    const maxE = _.max(log, d => d.e).e || 1;
-    const minE = _.min(log, d => d.e).e || 0;
-    const range = maxE - minE || 1;
+    // 定义五个阶段的目标体系
+    const phases = [
+      { // P1: 基础期 (RCL 1)
+        name: "基础·初始积累", icon: "🔰",
+        objectives: [
+          { label: "RCL 升到 2", done: () => rcl >= 2,
+            pct: () => Math.min(1, (cache.controller?.progress || 0) / (cache.controller?.progressTotal || 1)),
+            detail: () => rcl >= 2 ? "✅" : `${Math.round((cache.controller?.progress || 0) / (cache.controller?.progressTotal || 1) * 100)}%` },
+          { label: "采集者就位", done: () => (counts.harvester || 0) + (counts.staticHarvester || 0) >= 1,
+            pct: () => Math.min(1, (counts.harvester || 0) + (counts.staticHarvester || 0)),
+            detail: () => `${(counts.harvester || 0) + (counts.staticHarvester || 0)}/1` },
+          { label: "建造 Extensions", done: () => cache.extensions.length >= 5,
+            pct: () => Math.min(1, cache.extensions.length / 5),
+            detail: () => `${cache.extensions.length}/5` },
+          { label: "能量正增长", done: () => { const r = StatsTracker.energyRate(); return r !== null && r > 0; },
+            pct: () => { const r = StatsTracker.energyRate(); return r !== null ? (r > 0 ? 1 : 0) : 0; },
+            detail: () => { const r = StatsTracker.energyRate(); return r !== null ? `${r > 0 ? "+" : ""}${r.toFixed(1)}/t` : "测算中"; } },
+        ],
+      },
+      { // P2: 容器经济期 (RCL 2-3)
+        name: "容器·定点经济", icon: "📦",
+        objectives: [
+          { label: "RCL 升到 3", done: () => rcl >= 3,
+            pct: () => rcl >= 3 ? 1 : ((cache.controller?.progress || 0) / (cache.controller?.progressTotal || 1)),
+            detail: () => rcl >= 3 ? "✅" : `RCL2 ${Math.round((cache.controller?.progress || 0) / (cache.controller?.progressTotal || 1) * 100)}%` },
+          { label: "Container 覆盖", done: () => cache.sources.every(src => src.pos.findInRange(cache.containers, 1).length > 0),
+            pct: () => cache.sources.length > 0 ? cache.sources.filter(src => src.pos.findInRange(cache.containers, 1).length > 0).length / cache.sources.length : 0,
+            detail: () => `${cache.sources.filter(src => src.pos.findInRange(cache.containers, 1).length > 0).length}/${cache.sources.length}` },
+          { label: "定点采集就位", done: () => (counts.staticHarvester || 0) >= cache.sources.length,
+            pct: () => cache.sources.length > 0 ? Math.min(1, (counts.staticHarvester || 0) / cache.sources.length) : 0,
+            detail: () => `${counts.staticHarvester || 0}/${cache.sources.length}` },
+          { label: "搬运工就位", done: () => (counts.hauler || 0) >= 1,
+            pct: () => Math.min(1, (counts.hauler || 0)),
+            detail: () => `${counts.hauler || 0}/1` },
+          { label: "建造 Storage", done: () => !!cache.storage,
+            pct: () => cache.storage ? 1 : (cache.sites.some(s => s.structureType === STRUCTURE_STORAGE) ? 0.5 : 0),
+            detail: () => cache.storage ? "✅" : (cache.sites.some(s => s.structureType === STRUCTURE_STORAGE) ? "建造中" : "未建造") },
+        ],
+      },
+      { // P3: 设施完善期 (RCL 3-4)
+        name: "建造·设施完善", icon: "🛠",
+        objectives: [
+          { label: "RCL 升到 4", done: () => rcl >= 4,
+            pct: () => rcl >= 4 ? 1 : ((cache.controller?.progress || 0) / (cache.controller?.progressTotal || 1)),
+            detail: () => rcl >= 4 ? "✅" : `RCL3 ${Math.round((cache.controller?.progress || 0) / (cache.controller?.progressTotal || 1) * 100)}%` },
+          { label: "建造炮塔", done: () => cache.towers.length >= 1,
+            pct: () => Math.min(1, cache.towers.length / 1),
+            detail: () => `${cache.towers.length}/1` },
+          { label: "城墙/路障", done: () => cache.walls.length >= 10 || cache.ramparts.length >= 10,
+            pct: () => Math.min(1, (cache.walls.length + cache.ramparts.length) / 20),
+            detail: () => `墙${cache.walls.length} 障${cache.ramparts.length}` },
+          { label: "Storage 落成", done: () => !!cache.storage,
+            pct: () => cache.storage ? 1 : (cache.sites.some(s => s.structureType === STRUCTURE_STORAGE) ? 0.5 : 0),
+            detail: () => cache.storage ? "✅" : (cache.sites.some(s => s.structureType === STRUCTURE_STORAGE) ? "建造中" : "未建造") },
+          { label: "储能达标 10K", done: () => cache.storage && cache.storage.store[RESOURCE_ENERGY] >= 10000,
+            pct: () => cache.storage ? Math.min(1, cache.storage.store[RESOURCE_ENERGY] / 10000) : 0,
+            detail: () => cache.storage ? `${Math.round(cache.storage.store[RESOURCE_ENERGY] / 1000)}K/10K` : "无 Storage" },
+        ],
+      },
+      { // P4: 成长升级期 (RCL 4-6)
+        name: "成长·生产升级", icon: "⚗",
+        objectives: [
+          { label: "RCL 升到 6", done: () => rcl >= 6,
+            pct: () => rcl >= 6 ? 1 : Math.max(0, (rcl - 4) / 2),
+            detail: () => rcl >= 6 ? "✅" : `RCL${rcl}` },
+          { label: "炮塔完善", done: () => cache.towers.length >= 3,
+            pct: () => Math.min(1, cache.towers.length / 3),
+            detail: () => `${cache.towers.length}/3` },
+          { label: "储能达标 50K", done: () => cache.storage && cache.storage.store[RESOURCE_ENERGY] >= 50000,
+            pct: () => cache.storage ? Math.min(1, cache.storage.store[RESOURCE_ENERGY] / 50000) : 0,
+            detail: () => cache.storage ? `${Math.round(cache.storage.store[RESOURCE_ENERGY] / 1000)}K/50K` : "无 Storage" },
+          { label: "城墙维修者", done: () => (counts.wallRepairer || 0) >= 1,
+            pct: () => Math.min(1, (counts.wallRepairer || 0)),
+            detail: () => `${counts.wallRepairer || 0}/1` },
+          { label: "矿物/交易系统", done: () => false,
+            pct: () => 0, detail: () => "未完成·预留" },
+        ],
+      },
+      { // P5: 扩张期 (RCL 6+)
+        name: "扩张·跨房间", icon: "🚀",
+        objectives: [
+          { label: "远征采集", done: () => false,
+            pct: () => 0, detail: () => "未完成·预留" },
+          { label: "Claimer 就绪", done: () => false,
+            pct: () => 0, detail: () => "未完成·预留" },
+          { label: "Link 网络", done: () => false,
+            pct: () => 0, detail: () => `RCL${rcl}/6 · 未完成` },
+          { label: "多房间运营", done: () => Object.keys(Game.rooms).length > 1,
+            pct: () => Math.min(1, Object.keys(Game.rooms).length - 1),
+            detail: () => `${Object.keys(Game.rooms).length - 1}/1` },
+        ],
+      },
+    ];
+
+    // 定位当前阶段 (按 RCL)
+    let phaseIdx = 0;
+    if (rcl >= 6)      phaseIdx = 4;  // P5
+    else if (rcl >= 4) phaseIdx = 3;  // P4
+    else if (rcl >= 3) phaseIdx = 2;  // P3
+    else if (rcl >= 2) phaseIdx = 1;  // P2
+    // P1 为默认 (rcl === 1)
+
+    const phase = phases[phaseIdx];
+
+    // 阶段整体完成度
+    const totalObjs = phase.objectives.length;
+    const doneCount = phase.objectives.filter(o => o.done()).length;
+    const overallPct = totalObjs > 0 ? doneCount / totalObjs : 0;
+
+    // ---- 绘制面板 ----
+    const bx = 19.8, by = 1.5;
+    const pw = 16;
+    const objH = 0.55;
+    const panelH = 2.1 + phase.objectives.length * objH;
 
     // 背景
-    v.rect(bx - 0.2, by - 0.2, w + 0.4, h + 0.4, {
+    v.rect(bx - 0.2, by - 0.2, pw, panelH, {
       fill: "#0a0a0f", opacity: 0.55, stroke: "#222244", strokeWidth: 0.05,
     });
-    v.text("⚡能量趋势", bx + w / 2, by - 0.4, {
-      color: "#888888", font: "0.35", align: "center",
+
+    // 阶段标题
+    v.text(`${phase.icon} P${phaseIdx+1}/5 ${phase.name}`, bx + 0.1, by, {
+      color: "#ffcc00", font: "0.48", align: "left",
     });
 
-    // 折线
-    const pts = log.map((d, i) => [
-      bx + (i / (log.length - 1)) * w,
-      by + h - ((d.e - minE) / range) * h,
-    ]);
+    // 整体进度条
+    const barW = pw - 3;
+    const barY = by + 0.55;
+    v.rect(bx, barY, barW, 0.22, {
+      fill: "#1a1a2e", opacity: 0.8, stroke: "#333355", strokeWidth: 0.03,
+    });
+    if (overallPct > 0) v.rect(bx, barY, barW * overallPct, 0.22, {
+      fill: "#ffcc00", opacity: 0.75,
+    });
+    v.text(`${Math.round(overallPct * 100)}%`, bx + barW + 0.3, barY, {
+      color: "#ffcc00", font: "0.3", align: "left",
+    });
 
-    // 填充区域
-    if (pts.length >= 2) {
-      const fillPts = [...pts, [pts[pts.length - 1][0], by + h], [pts[0][0], by + h]];
-      for (let i = 0; i < fillPts.length - 1; i++) {
-        v.poly([
-          fillPts[i], fillPts[i + 1],
-          [fillPts[i + 1][0], fillPts[i][1]],
-        ], { fill: "#00ff88", opacity: 0.08, stroke: undefined });
-      }
-      v.poly(fillPts, { fill: "#00ff88", opacity: 0.12, stroke: undefined });
+    // 各项目标
+    for (let i = 0; i < phase.objectives.length; i++) {
+      const obj = phase.objectives[i];
+      const done = obj.done();
+      const pct = obj.pct();
+      const detail = obj.detail();
+      const icon = done ? "✅" : (pct > 0 ? "🔄" : "⬜");
+      const objColor = done ? "#66ff66" : (pct > 0 ? "#ffaa00" : "#666666");
+      const yy = barY + 0.4 + i * objH;
 
-      // 折线
-      for (let i = 0; i < pts.length - 1; i++) {
-        v.line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], {
-          color: "#00ff88", opacity: 0.7, lineStyle: "solid",
-        });
-      }
+      v.text(`${icon} ${obj.label}`, bx + 0.1, yy, { color: objColor, font: "0.38", align: "left" });
+      v.text(detail, bx + pw - 0.3, yy, { color: objColor, font: "0.38", align: "right" });
     }
-
-    // 当前值标注
-    const last = log[log.length - 1];
-    v.text(`${last.e}`, bx + w, by + h * 0.2, {
-      color: "#00ff88", font: "0.35", align: "right",
-    });
   },
 
   // ---- 警报系统 ----
