@@ -297,6 +297,23 @@ const BodyBuilder = {
 
     const body = [];
     for (let i = 0; i < repeats; i++) body.push(...pattern);
+
+    // ---- 剩余能量追加部件 ----
+    // 采集/升级角色追加额外 WORK 以用满容量
+    const canBoost = patternKey === 'harvester' || patternKey === 'staticHarvester'
+                  || patternKey === 'upgrader';
+    if (canBoost) {
+      let remaining = energyCapacity - BodyBuilder.cost(body);
+      while (remaining >= 150 && body.length < maxParts - 1) {
+        body.push(WORK);    // 100 能量
+        body.push(MOVE);    // 50 能量
+        remaining -= 150;
+      }
+      if (remaining >= 50 && body.length < maxParts)
+        body.push(CARRY);   // 50 能量
+    }
+    // ---- 追加结束 ----
+
     return body;
   },
 
@@ -544,6 +561,13 @@ const RoleUtil = {
    * 用于 Harvester (传统模式) 和 Hauler 的存放
    */
   findDepositTarget(cache) {
+    // 0. Controller Container 优先（能量低于 500 时）
+    const ctrl = cache.controller;
+    if (ctrl && ctrl.my) {
+      const ctrlCont = ctrl.pos.findInRange(cache.containers, 3)
+        .find(c => c.store.getFreeCapacity(RESOURCE_ENERGY) > 0 && c.store[RESOURCE_ENERGY] < 500);
+      if (ctrlCont) return ctrlCont;
+    }
     // Spawn
     const sp = _.find(cache.spawns, s => s.store.getFreeCapacity(RESOURCE_ENERGY) > 0);
     if (sp) return sp;
@@ -1165,6 +1189,9 @@ const RoomManager = {
         Logger.warn("房间", `⚠️ Spawn受损:${sp.hits}/${sp.hitsMax}`);
     }
 
+    // Controller Container 自动放置 (RCL2+)
+    this._planControllerContainer(cache);
+
     // 调试可视化 (CPU 降级时跳过)
     if (CONFIG.LOG_LEVEL <= 0 && !CPUGovernor.shouldSkipVisual()) {
       const v = cache.controller ? cache.controller.room.visual : null;
@@ -1182,6 +1209,45 @@ const RoomManager = {
         v.text(`🏛️RCL${cache.rcl}`, cache.controller.pos.x, cache.controller.pos.y - 1,
           { color: "#00ffff", fontSize: 0.6, align: "center" });
       }
+    }
+  },
+
+  /** 在 Controller 旁自动放置 Container（RCL2+） */
+  _planControllerContainer(cache) {
+    const ctrl = cache.controller;
+    if (!ctrl || !ctrl.my) return;
+    if (cache.rcl < 2) return;
+
+    // 已有 Controller 近旁的 Container → 跳过
+    const nearbyCont = ctrl.pos.findInRange(cache.containers, 3);
+    if (nearbyCont.length > 0) return;
+
+    // 已有工地 → 跳过
+    const hasSite = cache.sites.some(s =>
+      s.structureType === STRUCTURE_CONTAINER && s.pos.getRangeTo(ctrl) <= 3
+    );
+    if (hasSite) return;
+
+    // 选取最优位置: Controller 2 格内，非墙、非建筑
+    const room = Game.rooms[ctrl.room.name];
+    const terrain = room.getTerrain();
+    const candidates = [];
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        const px = ctrl.pos.x + dx, py = ctrl.pos.y + dy;
+        if (px < 1 || px > 48 || py < 1 || py > 48) continue;
+        if (terrain.get(px, py) === TERRAIN_MASK_WALL) continue;
+        const blocked = cache.myStructures.some(s => s.pos.x === px && s.pos.y === py)
+          || cache.sites.some(s => s.pos.x === px && s.pos.y === py);
+        if (blocked) continue;
+        candidates.push(new RoomPosition(px, py, room.name));
+      }
+    }
+    candidates.sort((a, b) => a.getRangeTo(ctrl) - b.getRangeTo(ctrl));
+    const best = candidates.find(c => c.getRangeTo(ctrl) >= 1);
+    if (best) {
+      room.createConstructionSite(best, STRUCTURE_CONTAINER);
+      Logger.info("建造", "📦 已放置 Controller Container 工地");
     }
   },
 };
@@ -1275,6 +1341,83 @@ const StatsTracker = {
 
 };
 
+
+// ============================================================
+//  SECTION: ROAD_PLANNER — 道路网络自动规划
+//  每 200 tick 沿三条主干道（Source→Spawn, Spawn→Controller）
+//  自动放置道路工地，让 Built 自然建造
+// ============================================================
+
+const RoadPlanner = {
+  run() {
+    const hr = Helpers.getHomeRoom();
+    const room = Game.rooms[hr];
+    if (!room) return;
+    const cache = RoomCache.get(hr);
+    if (!cache) return;
+
+    const spawn = cache.spawns[0];
+    const ctrl = cache.controller;
+    if (!spawn || !ctrl) return;
+
+    if (!Memory._lastRoadPlan) Memory._lastRoadPlan = 0;
+    if (Game.time - Memory._lastRoadPlan < 200) return;  // 每 200t 一次
+    Memory._lastRoadPlan = Game.time;
+
+    // 构建 CostMatrix：已有道路低成本，墙/路障不可通行
+    const costs = new PathFinder.CostMatrix();
+    for (const road of cache.roads)
+      costs.set(road.pos.x, road.pos.y, 1);
+    for (const s of cache.walls)
+      costs.set(s.pos.x, s.pos.y, 255);
+    for (const s of cache.ramparts)
+      costs.set(s.pos.x, s.pos.y, 255);
+    // 已有建筑不可通行（避免路径穿墙）
+    for (const s of cache.myStructures) {
+      if (s.structureType !== STRUCTURE_ROAD && s.structureType !== STRUCTURE_CONTAINER
+        && s.structureType !== STRUCTURE_RAMPART)
+        costs.set(s.pos.x, s.pos.y, 255);
+    }
+
+    // 三条关键路径: Source→Spawn + Spawn→Controller
+    const paths = [];
+    for (const src of cache.sources)
+      paths.push(this._findPath(spawn.pos, src.pos, costs));
+    paths.push(this._findPath(spawn.pos, ctrl.pos, costs));
+
+    // 放置道路工地（去重 + 避让已有建筑/工地）
+    const placed = new Set();
+    const terrain = room.getTerrain();
+    for (const path of paths) {
+      for (const pos of path) {
+        const key = `${pos.x},${pos.y}`;
+        if (placed.has(key)) continue;
+        placed.add(key);
+
+        // 检查该位置是否已被占用
+        const hasSite = cache.sites.some(s => s.pos.x === pos.x && s.pos.y === pos.y);
+        const hasRoad = cache.roads.some(s => s.pos.x === pos.x && s.pos.y === pos.y);
+        const hasStructure = cache.myStructures.some(s => s.pos.x === pos.x && s.pos.y === pos.y
+          && s.structureType !== STRUCTURE_CONTAINER);
+        if (hasSite || hasRoad || hasStructure) continue;
+        if (terrain.get(pos.x, pos.y) === TERRAIN_MASK_WALL) continue;
+
+        room.createConstructionSite(pos.x, pos.y, STRUCTURE_ROAD);
+      }
+    }
+  },
+
+  _findPath(from, to, costs) {
+    if (!from || !to) return [];
+    const result = PathFinder.search(from, { pos: to, range: 1 }, {
+      roomCallback: () => costs,
+      plainCost: 2,
+      swampCost: 10,
+      maxOps: 2000,
+    });
+    return result.path || [];
+  },
+};
 
 // ============================================================
 //  SECTION: VIS_CONFIG — 可视化 Flag 开关
@@ -1975,6 +2118,7 @@ module.exports.loop = function () {
 
   // 4. 管理模块
   RoomManager.run(counts);
+  RoadPlanner.run();      // 自动规划道路网络（每 200t）
   TowerManager.run();
 
   // 5. 运行所有 Creep
