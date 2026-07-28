@@ -606,7 +606,8 @@ const RoleUtil = {
     // 4. Spawn/Extension — RCL1 无其他能源时降低门槛，避免开局卡死
     const es = cache.energyCapacityAvailable > 0
       ? cache.energyAvailable / cache.energyCapacityAvailable : 0;
-    const withdrawThreshold = cache.rcl <= 1 ? 0.3 : 0.9;
+    // RCL1:0.3 | RCL2:0.5（无Container/Storage时必须降低门槛让Upgrader能取能）| RCL3+:0.9
+    const withdrawThreshold = cache.rcl <= 1 ? 0.3 : cache.rcl <= 2 ? 0.5 : 0.9;
     if (es >= withdrawThreshold) {
       const se = creep.pos.findClosestByRange(
         [...cache.spawns, ...cache.extensions].filter(
@@ -1013,6 +1014,15 @@ const Hauler = {
           creep.moveTo(cache.terminal, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
       }
     }
+
+    // 5. RCL<3 且无 Container 时的 fallback：直接去 Source 采集（避免搬运工在容器经济启动前空闲）
+    if (cache.rcl < 3 && !cache.containers.length) {
+      const src = creep.pos.findClosestByRange(cache.sources);
+      if (src) {
+        if (creep.harvest(src) === ERR_NOT_IN_RANGE)
+          creep.moveTo(src, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffaa00" } });
+      }
+    }
   },
 };
 
@@ -1260,8 +1270,12 @@ const SpawnManager = {
     if (c("harvester") < P.MIN_HARVESTERS || this._needMoreHarv(counts, cache)) {
       queue.push({ role: "harvester", priority: 0, reason: "min_harvester" });
     }
-    // 定点采集（每个 Source 一个）
-    if (cache && rcl >= CONFIG.CONTAINER.ENABLE_AT_RCL && c("staticHarvester") < cache.sources.length) {
+    // 定点采集（每个 Source 一个）— 仅在 Source Container 就位后生成
+    const sourceContainersReady = cache.sources.every(src =>
+      src.pos.findInRange(cache.containers, 1).length > 0 ||
+      cache.sites.some(s => s.structureType === STRUCTURE_CONTAINER && s.pos.getRangeTo(src) <= 1)
+    );
+    if (cache && rcl >= CONFIG.CONTAINER.ENABLE_AT_RCL && sourceContainersReady && c("staticHarvester") < cache.sources.length) {
       queue.push({ role: "staticHarvester", priority: 0, reason: "min_static" });
     }
     // 运输者
@@ -1869,6 +1883,8 @@ const RoomManager = {
 
     // Controller Container 自动放置 (RCL2+)
     this._planControllerContainer(cache);
+    // Source Container 自动放置 (RCL2+) — 容器经济的基础设施
+    this._planSourceContainers(cache);
 
     // 调试可视化 (CPU 降级时跳过)
     if (CONFIG.LOG_LEVEL <= 0 && !CPUGovernor.shouldSkipVisual()) {
@@ -1926,6 +1942,44 @@ const RoomManager = {
     if (best) {
       room.createConstructionSite(best, STRUCTURE_CONTAINER);
       Logger.info("建造", "📦 已放置 Controller Container 工地");
+    }
+  },
+
+  /** 在 Source 旁自动放置 Container（RCL2+）— 容器经济基础设施 */
+  _planSourceContainers(cache) {
+    if (cache.rcl < 2) return;
+    const room = Game.rooms[cache.controller.room.name];
+    if (!room) return;
+    const terrain = room.getTerrain();
+
+    for (const src of cache.sources) {
+      // 已有 Source 旁的 Container → 跳过
+      const nearCont = src.pos.findInRange(cache.containers, 1);
+      if (nearCont.length > 0) continue;
+
+      // 已有 Container 工地 → 跳过
+      const hasSite = cache.sites.some(s =>
+        s.structureType === STRUCTURE_CONTAINER && s.pos.getRangeTo(src) <= 1
+      );
+      if (hasSite) continue;
+
+      // 在 Source 1 格范围内找空地
+      const candidates = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const px = src.pos.x + dx, py = src.pos.y + dy;
+          if (px < 1 || px > 48 || py < 1 || py > 48) continue;
+          if (terrain.get(px, py) === TERRAIN_MASK_WALL) continue;
+          const blocked = cache.myStructures.some(s => s.pos.x === px && s.pos.y === py)
+            || cache.sites.some(s => s.pos.x === px && s.pos.y === py);
+          if (blocked) continue;
+          candidates.push(new RoomPosition(px, py, room.name));
+        }
+      }
+      if (candidates.length > 0) {
+        room.createConstructionSite(candidates[0], STRUCTURE_CONTAINER);
+        Logger.info("建造", `📦 已放置 Source Container 工地 @(${src.pos.x},${src.pos.y})`);
+      }
     }
   },
 };
