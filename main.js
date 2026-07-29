@@ -44,7 +44,6 @@ const CONFIG = {
     WALL_REPAIRER:   "wallRepairer",
     CLAIMER:         "claimer",
     REMOTE_HAULER:   "remoteHauler",
-    REMOTE_MINER:    "remoteMiner",
   },
 
   // 种群控制
@@ -57,7 +56,6 @@ const CONFIG = {
     MIN_WALL_REPAIRERS: 0,  MAX_WALL_REPAIRERS: 1,
     MIN_CLAIMERS:   0,      MAX_CLAIMERS:   1,
     MIN_REMOTE_HAULERS: 0,  MAX_REMOTE_HAULERS: 2,
-    MIN_REMOTE_MINERS:  0,  MAX_REMOTE_MINERS:  3,
     MAX_STATICHARVESTERS: 4,
   },
 
@@ -103,12 +101,15 @@ const CONFIG = {
 
   // 邮件通知 (发送到注册邮箱)
   NOTIFY: {
-    ENABLED:      false,   // 总开关（默认关闭，需要时手动开启）
+    ENABLED:      true,    // 总开关
     ON_HOSTILES:  true,    // 敌人入侵时通知
     ON_ALL_DEAD:  true,    // 所有 Creep 死亡时通知
     ON_STARTUP:   true,    // 脚本启动时发送现状报告
     ON_LOW_ENERGY:true,    // 能量持续 < 15% 时通知
-    INTERVAL:     172800,  // 同类通知最小间隔 (tick, 172800 ≈ 48小时)
+    // Game.notify 的 groupInterval 单位是【分钟】且上限 1440(24h)，
+    // 原值 172800 超出合法范围会被 API 拒绝 → 邮件分组失效
+    INTERVAL:     1440,    // 同类通知最小间隔 (分钟, 1440 = 24 小时)
+    LOW_ENERGY_TICKS: 300, // 能量需连续低于 15% 这么多 tick 才发信(避开孵化瞬时低谷)
   },
 
   // ---- 长期扩展预留 ----
@@ -329,8 +330,19 @@ const BODY_PATTERNS = {
   // 长期预留
   claimer:          [CLAIM, MOVE],                        // 650 能量/组
   remoteHauler:     [CARRY, CARRY, CARRY, CARRY, MOVE, MOVE], // 400 能量/组
-  remoteMiner:      [WORK, WORK, WORK, CARRY, CARRY, MOVE, MOVE, MOVE], // 550/组 (3W+2C+3M)
 };
+
+/**
+ * 各角色的“最小可用身体” — 能量不足时的保底方案
+ * 关键: claimer 没有 CLAIM 部件就完全无法 reserveController，
+ * 统一保底成 [WORK,CARRY,MOVE] 会造出一个永远干不了活的废人
+ */
+const MIN_BODIES = {
+  claimer:      [CLAIM, MOVE],
+  hauler:       [CARRY, CARRY, MOVE],
+  remoteHauler: [CARRY, CARRY, MOVE],
+};
+const DEFAULT_MIN_BODY = [WORK, CARRY, MOVE];
 
 const BodyBuilder = {
   /**
@@ -349,7 +361,7 @@ const BodyBuilder = {
     const affordable  = Math.floor(energyCapacity / groupCost);
     const repeats     = Math.min(affordable, maxRepeats);
 
-    if (repeats <= 0) return [WORK, CARRY, MOVE]; // 最低保底 (200 能量)
+    if (repeats <= 0) return this.minBody(patternKey); // 最低保底(按角色区分)
 
     const body = [];
     for (let i = 0; i < repeats; i++) body.push(...pattern);
@@ -371,6 +383,11 @@ const BodyBuilder = {
     // ---- 追加结束 ----
 
     return body;
+  },
+
+  /** 该角色的最小可用身体 */
+  minBody(patternKey) {
+    return MIN_BODIES[patternKey] || DEFAULT_MIN_BODY;
   },
 
   /** 计算身体成本 */
@@ -523,7 +540,11 @@ const Helpers = {
       builder: "建造", repairer: "维修", hauler: "运输", wallRepairer: "城墙",
       claimer: "占领", remoteHauler: "远征",
     };
-    return `${map[role] || role}_${Game.time}`;
+    // 同一 tick 内多个 Spawn 生成同角色会撞名(ERR_NAME_EXISTS)，加个 tick 内序号
+    if (Memory._nameTick !== Game.time) { Memory._nameTick = Game.time; Memory._nameSeq = 0; }
+    Memory._nameSeq++;
+    const suffix = Memory._nameSeq > 1 ? `_${Memory._nameSeq}` : "";
+    return `${map[role] || role}_${Game.time}${suffix}`;
   },
 
   /** 清理死亡 Creep 内存（仅调用一次/tick） */
@@ -558,7 +579,10 @@ const RoleUtil = {
       creep.memory.targetId = null; // 重置目标，下次重新搜索
       return true;
     }
-    if (creep.memory.state !== STATES.HARVESTING && creep.store[RESOURCE_ENERGY] === 0) {
+    // 用 getUsedCapacity() 而不是 store[RESOURCE_ENERGY]:
+    // 身上只剩矿物/化合物(能量为 0)时，旧写法会把满载的 Creep 判成"空"并切回采集，
+    // 于是它既卸不掉货又装不进东西，永久卡死
+    if (creep.memory.state !== STATES.HARVESTING && creep.store.getUsedCapacity() === 0) {
       creep.memory.state = STATES.HARVESTING;
       creep.memory.targetId = null;
       return true;
@@ -606,15 +630,34 @@ const RoleUtil = {
       }
     }
 
-    // 4. Spawn/Extension — RCL1 无其他能源时降低门槛，避免开局卡死
+    // 4. 自带 WORK 的角色 → 自己去挖，优先于抽 Spawn
+    //    顺序很关键：Spawn 里的能量是"造下一个 Creep 的本钱"，只出不进。
+    //    让建造者/升级者随手把它抽走，采集者一旦老死就再也凑不出复活的能量 → 死亡螺旋
+    if (creep.getActiveBodyparts(WORK) > 0) {
+      const src = creep.pos.findClosestByRange(cache.sources.filter(s => s.energy > 0));
+      if (src) {
+        if (creep.harvest(src) === ERR_NOT_IN_RANGE)
+          creep.moveTo(src, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffaa00" } });
+        return true;
+      }
+    }
+
+    // 5. Spawn/Extension — 只留给没有 WORK 部件、确实挖不了矿的角色
     const es = cache.energyCapacityAvailable > 0
       ? cache.energyAvailable / cache.energyCapacityAvailable : 0;
     // RCL1:0.3 | RCL2:0.5（无Container/Storage时必须降低门槛让Upgrader能取能）| RCL3+:0.9
     const withdrawThreshold = cache.rcl <= 1 ? 0.3 : cache.rcl <= 2 ? 0.5 : 0.9;
-    if (es >= withdrawThreshold) {
+    // 房间没有采集者时，必须始终留住"复活一个采集者"的本钱(200)。
+    // 只锁这一份，而不是全锁 —— 能量充裕时采集者本 tick 就会被孵出来，
+    // 此时再拦着升级者取能只会让它白白空转
+    const reviveReserve = Emergency.noHarvesters(cache) ? Emergency.reviveCost() : 0;
+    const wouldTake = creep.store.getFreeCapacity(RESOURCE_ENERGY);
+    if (es >= withdrawThreshold && cache.energyAvailable - wouldTake >= reviveReserve) {
+      // 注意阈值必须是 > 0 而不是 > 50：Extension 满仓正好就是 50，
+      // 用 > 50 会导致 Extension 永远被跳过，开局只能从 Spawn 取能
       const se = creep.pos.findClosestByRange(
         [...cache.spawns, ...cache.extensions].filter(
-          s => s.store[RESOURCE_ENERGY] > 50
+          s => s.store[RESOURCE_ENERGY] > 0
         )
       );
       if (se) {
@@ -698,6 +741,11 @@ const RoleUtil = {
 // ---------- 采集者 Harvester ----------
 
 const Harvester = {
+  /** harvester 与 staticHarvester 共用本模块，Source 分配需一并统计 */
+  _isHarvestRole(role) {
+    return role === CONFIG.ROLES.HARVESTER || role === CONFIG.ROLES.STATIC_HARVESTER;
+  },
+
   run(creep) {
     RoleUtil.toggleState(creep, STATES.WORKING);
 
@@ -812,10 +860,13 @@ const Harvester = {
     if (!cache || !cache.sources.length) return;
 
     // 统计每个 Source 的采集者负载
+    // staticHarvester 复用的就是本模块，必须一起计数，
+    // 否则所有定点采集者都会被算成 0 负载而挤到同一个 Source 上
     const load = {};
     for (const s of cache.sources) load[s.id] = 0;
     for (const c of cache.myCreeps) {
-      if (c.memory.role === CONFIG.ROLES.HARVESTER && c.memory.sourceId)
+      if (c.name === creep.name) continue;
+      if (Harvester._isHarvestRole(c.memory.role) && c.memory.sourceId)
         load[c.memory.sourceId] = (load[c.memory.sourceId] || 0) + 1;
     }
 
@@ -838,7 +889,8 @@ const Harvester = {
     const load = {};
     for (const s of available) load[s.id] = 0;
     for (const c of cache.myCreeps) {
-      if (c.memory.role === CONFIG.ROLES.HARVESTER && c.memory.sourceId && load[c.memory.sourceId] !== undefined)
+      if (c.name === creep.name) continue;
+      if (Harvester._isHarvestRole(c.memory.role) && c.memory.sourceId && load[c.memory.sourceId] !== undefined)
         load[c.memory.sourceId] = (load[c.memory.sourceId] || 0) + 1;
     }
 
@@ -855,6 +907,17 @@ const Harvester = {
 const Upgrader = {
   run(creep) {
     RoleUtil.toggleState(creep, STATES.UPGRADING);
+
+    // LabManager 点名要强化 → 先去 Lab 报到（强化是一次性投入，值得绕这一趟）
+    if (creep.memory._boostLabId && !creep.memory._boosted) {
+      const lab = Game.getObjectById(creep.memory._boostLabId);
+      if (lab && creep.pos.getRangeTo(lab.pos) > 1) {
+        creep.moveTo(lab, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
+        creep.say("🧪");
+        return;
+      }
+      if (!lab) delete creep.memory._boostLabId;
+    }
 
     if (creep.memory.state === STATES.UPGRADING) {
       const ctrl = creep.room.controller;
@@ -875,6 +938,15 @@ const Upgrader = {
 const Builder = {
   run(creep) {
     RoleUtil.toggleState(creep, STATES.BUILDING);
+
+    // 处于 HARVESTING 之外的任何状态都算"满载干活"。
+    // 原来只判 BUILDING，一旦无工地被切成 UPGRADING，下一 tick 就会掉进
+    // else 分支去取能量 —— 而它本来就是满的，于是永远卡在"取能量"里不再升级
+    if (creep.memory.state === STATES.HARVESTING) {
+      RoleUtil.withdraw(creep);
+      RoleUtil.sayState(creep);
+      return;
+    }
 
     if (creep.memory.state === STATES.BUILDING) {
       const cache = RoomCache.get(creep.room.name);
@@ -907,7 +979,8 @@ const Builder = {
           `进度:${((target.progress / target.progressTotal) * 100).toFixed(1)}%`);
       }
     } else {
-      RoleUtil.withdraw(creep);
+      // UPGRADING 等 fallback 状态
+      RoleUtil.upgradeFallback(creep);
     }
     RoleUtil.sayState(creep);
   },
@@ -918,6 +991,13 @@ const Builder = {
 const Repairer = {
   run(creep) {
     RoleUtil.toggleState(creep, STATES.REPAIRING);
+
+    // 同 Builder：只有 HARVESTING 才是"去取能量"，其余都是干活状态
+    if (creep.memory.state === STATES.HARVESTING) {
+      RoleUtil.withdraw(creep);
+      RoleUtil.sayState(creep);
+      return;
+    }
 
     if (creep.memory.state === STATES.REPAIRING) {
       const structs = Helpers.findToRepair(creep.room.name);
@@ -941,7 +1021,7 @@ const Repairer = {
           `耐久:${((target.hits / target.hitsMax) * 100).toFixed(1)}%`);
       }
     } else {
-      RoleUtil.withdraw(creep);
+      RoleUtil.upgradeFallback(creep);
     }
     RoleUtil.sayState(creep);
   },
@@ -959,10 +1039,18 @@ const Hauler = {
 
       // 非能量资源 → 运往 Lab（RCL6+）
       const nonEnergy = Object.keys(creep.store).find(k => k !== RESOURCE_ENERGY && creep.store[k] > 0);
-      if (nonEnergy && cache.labs && cache.labs.length) {
-        const targetLab = cache.labs.find(l => l.mineralType === null || l.mineralType === nonEnergy);
-        if (targetLab && creep.transfer(targetLab, nonEnergy) === ERR_NOT_IN_RANGE)
-          creep.moveTo(targetLab, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
+      if (nonEnergy) {
+        // 找不到 Lab 时必须有退路(Terminal/Storage)，否则货卸不掉 → Creep 永久卡死
+        const targetLab = (cache.labs || []).find(l =>
+          (l.mineralType === null || l.mineralType === nonEnergy) &&
+          l.store.getFreeCapacity(nonEnergy) > 0);
+        const dest = targetLab || cache.terminal || cache.storage;
+        if (dest) {
+          if (creep.transfer(dest, nonEnergy) === ERR_NOT_IN_RANGE)
+            creep.moveTo(dest, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
+        } else {
+          creep.drop(nonEnergy);   // 实在无处可放，丢掉也好过一直堵着
+        }
         RoleUtil.sayState(creep);
         return;
       }
@@ -1002,25 +1090,34 @@ const Hauler = {
       return;
     }
 
-    // 3. Storage
-    if (cache.storage && cache.storage.store[RESOURCE_ENERGY] > 0) {
-      if (creep.withdraw(cache.storage, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE)
-        creep.moveTo(cache.storage, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffaa00" } });
-    }
-
-    // 4. 实验室化合物补给 (RCL6+ 从 Terminal 取)
+    // 3. 实验室化合物补给 (RCL6+ 从 Terminal 取)
+    //    必须排在 Storage 之前：Storage 分支一旦命中就 return，否则本段永远不会执行
     if (cache.terminal && cache.labs && cache.labs.length) {
-      const compound = CONFIG.LABS.BOOST_COMPOUNDS.find(c => cache.terminal.store[c] > 30);
+      const compound = CONFIG.LABS.BOOST_COMPOUNDS.find(c =>
+        (cache.terminal.store[c] || 0) >= 30 &&
+        cache.labs.some(l => (l.mineralType === null || l.mineralType === c)
+                          && (l.store[c] || 0) < CONFIG.LABS.COMPOUND_BUY_AMOUNT)
+      );
       if (compound) {
-        const needsLab = cache.labs.find(l => l.mineralType === null || l.mineralType === compound);
-        if (needsLab && creep.withdraw(cache.terminal, compound, 30) === ERR_NOT_IN_RANGE)
-          creep.moveTo(cache.terminal, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
+        const amount = Math.min(creep.store.getFreeCapacity(compound), cache.terminal.store[compound]);
+        if (amount > 0) {
+          if (creep.withdraw(cache.terminal, compound, amount) === ERR_NOT_IN_RANGE)
+            creep.moveTo(cache.terminal, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
+          return;
+        }
       }
     }
 
+    // 4. Storage
+    if (cache.storage && cache.storage.store[RESOURCE_ENERGY] > 0) {
+      if (creep.withdraw(cache.storage, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE)
+        creep.moveTo(cache.storage, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffaa00" } });
+      return;   // 缺 return 会和下面的分支抢同一个 tick 的 withdraw/move 意图
+    }
+
     // 5. RCL<3 且无 Container 时的 fallback：直接去 Source 采集（避免搬运工在容器经济启动前空闲）
-    if (cache.rcl < 3 && !cache.containers.length) {
-      const src = creep.pos.findClosestByRange(cache.sources);
+    if (cache.rcl < 3 && !cache.containers.length && creep.getActiveBodyparts(WORK) > 0) {
+      const src = creep.pos.findClosestByRange(cache.sources.filter(s => s.energy > 0));
       if (src) {
         if (creep.harvest(src) === ERR_NOT_IN_RANGE)
           creep.moveTo(src, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffaa00" } });
@@ -1034,6 +1131,13 @@ const Hauler = {
 const WallRepairer = {
   run(creep) {
     RoleUtil.toggleState(creep, STATES.REPAIRING);
+
+    // 同 Builder/Repairer：非 HARVESTING 一律按干活处理
+    if (creep.memory.state === STATES.HARVESTING) {
+      this._withdraw(creep);
+      RoleUtil.sayState(creep);
+      return;
+    }
 
     if (creep.memory.state === STATES.REPAIRING) {
       const target = this._findWall(creep);
@@ -1051,7 +1155,7 @@ const WallRepairer = {
           `耐久:${((target.hits / target.hitsMax) * 100).toFixed(2)}%`);
       }
     } else {
-      this._withdraw(creep);
+      RoleUtil.upgradeFallback(creep);
     }
     RoleUtil.sayState(creep);
   },
@@ -1061,13 +1165,16 @@ const WallRepairer = {
     if (!cache) return null;
     const R = CONFIG.REPAIR;
 
+    // 修补目标 = 血量低于 WALL_MAX_RATIO 的墙/壁垒，取最残的那个。
+    // 原实现先按 WALL_MAX_RATIO(0.001) 筛出候选，再要求最残者还得低于
+    // WALL_THRESHOLD(0.0001) 才肯动手 —— 两个阈值方向相反，
+    // 结果墙一旦修到 0.01% 就撒手不管，筛选出来的候选几乎全被丢弃
     const candidates = [...cache.walls, ...cache.ramparts].filter(
       s => s.hits < s.hitsMax * R.WALL_MAX_RATIO
     );
     if (!candidates.length) return null;
 
-    const sorted = _.sortBy(candidates, s => s.hits / s.hitsMax);
-    return sorted[0].hits < sorted[0].hitsMax * R.WALL_THRESHOLD ? sorted[0] : null;
+    return _.sortBy(candidates, s => s.hits / s.hitsMax)[0];
   },
 
   _withdraw(creep) {
@@ -1114,23 +1221,24 @@ const Claimer = {
     const ctrl = creep.room.controller;
     if (!ctrl) return;
 
+    // 每个分支都要 return：原实现在 reserve 成功后还会再发一次"回家"的 moveTo，
+    // 同一 tick 两条互相打架的移动意图，Claimer 会在房间边界来回抖动
     const result = creep.reserveController(ctrl);
     if (result === ERR_NOT_IN_RANGE) {
       creep.moveTo(ctrl, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
-    } else if (result === OK) {
+      return;
+    }
+    if (result === OK) {
       const ticksLeft = ctrl.reservation ? ctrl.reservation.ticksToEnd : 0;
       if (Memory.remoteRooms && Memory.remoteRooms[targetRoom]) {
         Memory.remoteRooms[targetRoom].reservedUntil = Game.time + ticksLeft;
       }
-      Logger.info("远征", `🏴 续约 ${targetRoom}`, `剩余:${ticksLeft}t`);
+      if (Game.time % 100 === 0)
+        Logger.info("远征", `🏴 续约 ${targetRoom}`, `剩余:${ticksLeft}t`);
+      return;
     }
-
-    // 续约足够 → 回家待命
-    if (ctrl.reservation && ctrl.reservation.ticksToEnd > CONFIG.REMOTE.CLAIMER_RENEW_AT) {
-      const homeExit = creep.room.findExitTo(creep.memory.homeRoom);
-      if (homeExit !== ERR_NO_PATH && homeExit !== ERR_INVALID_ARGS)
-        creep.moveTo(creep.pos.findClosestByRange(homeExit), { reusePath: 50 });
-    }
+    // 控制器不可预定(已被他人占领 / 是自己的房间)
+    Logger.warn("远征", `⚠️ 无法预定 ${targetRoom}`, `code:${result}`);
   },
 };
 
@@ -1213,126 +1321,71 @@ const RemoteHauler = {
   },
 };
 
-// ---------- 远程矿工 RemoteMiner ----------
-// 自给型远程采集：走到 src_* Flag → 挖 Source → 满了运回家 → 循环
-// 一个 Flag = 一个矿工，不依赖 RemoteHauler
+// ============================================================
+//  SECTION: EMERGENCY — 采集者灭绝时的自救
+//
+//  Screeps 里 Spawn 的能量只出不进：唯一的入口是采集者把矿运回来。
+//  一旦采集者全部死光、而房间剩余能量又凑不出一个新采集者(200)，
+//  局面就永久锁死 —— 谁也造不出来，谁也不会去挖矿。
+//  这里让任何带 WORK+CARRY 的 Creep(建造者/升级者/维修者)临时改行去挖矿送回 Spawn，
+//  把能量顶回复活线以上，孵化出采集者后自动退出该模式。
+// ============================================================
 
-const RemoteMiner = {
-  run(creep) {
-    RoleUtil.toggleState(creep, STATES.WORKING);
-
-    if (creep.memory.state === STATES.HARVESTING) {
-      this._gotoAndHarvest(creep);
-    } else {
-      this._returnAndDeposit(creep);
-    }
-    RoleUtil.sayState(creep);
+const Emergency = {
+  /** 房间里还有没有采集者(含定点采集) */
+  noHarvesters(cache) {
+    if (!cache) return false;
+    for (const c of cache.myCreeps)
+      if (Harvester._isHarvestRole(c.memory.role)) return false;
+    return true;
   },
 
-  /** 前往 Flag 所在房间，找到 Source 并采集 */
-  _gotoAndHarvest(creep) {
-    const flagName = creep.memory.flagName;
-    if (!flagName) { Logger.error("RemoteMiner", `${creep.name} 无 Flag 分配`); return; }
-
-    const flag = Game.flags[flagName];
-    if (!flag) {
-      // Flag 被删除 → 回家待命
-      Logger.warn("RemoteMiner", `${creep.name} Flag "${flagName}" 已删除，返回基地`);
-      this._returnHomeIdle(creep);
-      return;
-    }
-
-    // 1. 跨房间移动到 Flag 所在房间
-    if (creep.room.name !== flag.pos.roomName) {
-      const exit = creep.room.findExitTo(flag.pos.roomName);
-      if (exit !== ERR_NO_PATH && exit !== ERR_INVALID_ARGS) {
-        creep.moveTo(creep.pos.findClosestByRange(exit), {
-          reusePath: 50, visualizePathStyle: { stroke: "#ff8800" },
-        });
-      }
-      return;
-    }
-
-    // 2. 在目标房间：找离 Flag 最近的 Source
-    const sources = creep.room.find(FIND_SOURCES);
-    if (!sources.length) {
-      Logger.error("RemoteMiner", `${creep.name} 目标房间 ${flag.pos.roomName} 无 Source`);
-      return;
-    }
-
-    const source = flag.pos.findClosestByRange(sources);
-    if (!source) return;
-
-    // 3. 移动到 Source 旁边
-    if (creep.pos.getRangeTo(source) > 1) {
-      creep.moveTo(source, {
-        reusePath: 50, visualizePathStyle: { stroke: "#ffaa00" },
-      });
-      return;
-    }
-
-    // 4. 在 Source 旁：采集
-    const r = creep.harvest(source);
-    if (r === OK) {
-      // 重置失败计数
-      if (creep.memory._harvestFailCount) creep.memory._harvestFailCount = 0;
-    } else if (r === ERR_NOT_ENOUGH_RESOURCES) {
-      // Source 枯竭 → 记录并等待
-      creep.memory._harvestFailCount = (creep.memory._harvestFailCount || 0) + 1;
-      if (creep.memory._harvestFailCount >= 30) {
-        // 30 tick 连败 → Source 可能被占满，做小幅位移
-        const dx = Math.floor(Math.sin(Game.time * 0.1) * 2);
-        const dy = Math.floor(Math.cos(Game.time * 0.13) * 2);
-        creep.moveTo(
-          Math.max(1, Math.min(48, source.pos.x + dx)),
-          Math.max(1, Math.min(48, source.pos.y + dy)),
-          { reusePath: 10 }
-        );
-      }
-    }
+  /** 复活一个最小采集者需要多少能量 */
+  reviveCost() {
+    return BodyBuilder.cost(BodyBuilder.minBody(CONFIG.ROLES.HARVESTER));
   },
 
-  /** 满载：返回主房间存放能量 */
-  _returnAndDeposit(creep) {
-    // 1. 跨房间回家
-    if (creep.room.name !== creep.memory.homeRoom) {
-      const exit = creep.room.findExitTo(creep.memory.homeRoom);
-      if (exit !== ERR_NO_PATH && exit !== ERR_INVALID_ARGS) {
-        creep.moveTo(creep.pos.findClosestByRange(exit), {
-          reusePath: 50, visualizePathStyle: { stroke: "#ffffff" },
-        });
-      }
-      return;
-    }
-
-    // 2. 到家：存放能量
-    const cache = RoomCache.get(creep.room.name);
-    if (!cache) return;
-
-    // 优先 Storage（高效），其次 Spawn/Extension
-    if (cache.storage && cache.storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-      if (creep.transfer(cache.storage, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE)
-        creep.moveTo(cache.storage, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffffff" } });
-    } else {
-      const target = RoleUtil.findDepositTarget(cache);
-      if (target && creep.transfer(target, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE)
-        creep.moveTo(target, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ffffff" } });
-    }
+  /** 是否处于"没有采集者且造不出采集者"的死锁 */
+  isDeadlocked(cache) {
+    if (!cache || !cache.spawns.length) return false;
+    if (!this.noHarvesters(cache)) return false;
+    return cache.energyAvailable < this.reviveCost();
   },
 
-  /** Flag 被删除时的回家逻辑 */
-  _returnHomeIdle(creep) {
-    if (creep.room.name !== creep.memory.homeRoom) {
-      const exit = creep.room.findExitTo(creep.memory.homeRoom);
-      if (exit !== ERR_NO_PATH && exit !== ERR_INVALID_ARGS)
-        creep.moveTo(creep.pos.findClosestByRange(exit), { reusePath: 50 });
+  /** 这个 Creep 能不能顶上采集者的活 */
+  canRescue(creep) {
+    return creep.getActiveBodyparts(WORK) > 0 && creep.store.getCapacity() > 0;
+  },
+
+  /** 临时采集者行为：挖满 → 送回 Spawn/Extension */
+  run(creep, cache) {
+    const hasRoom = creep.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+    const src = hasRoom
+      ? creep.pos.findClosestByRange(cache.sources.filter(s => s.energy > 0))
+      : null;
+
+    if (src) {
+      if (creep.harvest(src) === ERR_NOT_IN_RANGE)
+        creep.moveTo(src, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff0000" } });
+      creep.say("🆘挖");
       return;
     }
-    // 到家：靠近 Spawn 待命
-    const spawn = Helpers.getHomeSpawn();
-    if (spawn && creep.pos.getRangeTo(spawn) > 3)
-      creep.moveTo(spawn, { reusePath: 25 });
-    creep.say("🏠待命");
+
+    if ((creep.store[RESOURCE_ENERGY] || 0) === 0) {
+      creep.say("🆘等");
+      return;   // 没货也挖不到，原地等 Source 刷新
+    }
+
+    // 送回 Spawn（优先），其次 Extension —— 这是唯一能解除死锁的方向
+    const dest = creep.pos.findClosestByRange(
+      [...cache.spawns, ...cache.extensions].filter(
+        s => s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+      )
+    );
+    if (!dest) { creep.say("🆘满"); return; }
+    if (creep.transfer(dest, RESOURCE_ENERGY) === ERR_NOT_IN_RANGE)
+      creep.moveTo(dest, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff0000" } });
+    creep.say("🆘送");
   },
 };
 
@@ -1343,6 +1396,24 @@ const RemoteMiner = {
 // ---------- 孵化管理器 ----------
 
 const SpawnManager = {
+  /**
+   * 角色 → POPULATION 上限键 的显式映射
+   * 原来用 `MAX_${role.toUpperCase()}S` 拼接，wallRepairer→MAX_WALLREPAIRERS、
+   * remoteHauler→MAX_REMOTEHAULERS 都拼错了(配置里是 MAX_WALL_REPAIRERS /
+   * MAX_REMOTE_HAULERS)，取到 undefined 后上限检查被整个跳过
+   */
+  MAX_KEYS: {
+    harvester:       "MAX_HARVESTERS",
+    staticHarvester: "MAX_STATICHARVESTERS",
+    upgrader:        "MAX_UPGRADERS",
+    builder:         "MAX_BUILDERS",
+    repairer:        "MAX_REPAIRERS",
+    hauler:          "MAX_HAULERS",
+    wallRepairer:    "MAX_WALL_REPAIRERS",
+    claimer:         "MAX_CLAIMERS",
+    remoteHauler:    "MAX_REMOTE_HAULERS",
+  },
+
   /** @param {object} counts — 角色计数 */
   run(counts) {
     const homeRoom = Helpers.getHomeRoom();
@@ -1379,18 +1450,6 @@ const SpawnManager = {
     const queue = [];
     const c = (r) => counts[r] || 0;
 
-    // 辅助：将角色加入队列
-    const add = (role, min, maxKey, reason) => {
-      const max = CONFIG.POPULATION[maxKey];
-      if (max !== undefined && c(role) >= max) return;
-      // P0: 低于最低要求 → 最高优先
-      if (min !== undefined && c(role) < min) {
-        queue.push({ role, priority: 0, reason });
-      } else {
-        queue.push({ role, priority: 3, reason });
-      }
-    };
-
     // === T0: 关键最小数 ===
     // 基础采集者
     if (c("harvester") < P.MIN_HARVESTERS || this._needMoreHarv(counts, cache)) {
@@ -1404,13 +1463,13 @@ const SpawnManager = {
     if (cache && rcl >= CONFIG.CONTAINER.ENABLE_AT_RCL && sourceContainersReady && c("staticHarvester") < cache.sources.length) {
       queue.push({ role: "staticHarvester", priority: 0, reason: "min_static" });
     }
-    // 升级者 — 必须排在运输者之前，确保开局优先出升级者
-    if (c("upgrader") < P.MIN_UPGRADERS) {
-      queue.push({ role: "upgrader", priority: 0, reason: "min_upgrader" });
-    }
     // 运输者
     if (cache && rcl >= CONFIG.CONTAINER.ENABLE_AT_RCL && c("hauler") < P.MIN_HAULERS) {
       queue.push({ role: "hauler", priority: 0, reason: "min_hauler" });
+    }
+    // 升级者
+    if (c("upgrader") < P.MIN_UPGRADERS) {
+      queue.push({ role: "upgrader", priority: 0, reason: "min_upgrader" });
     }
 
     // === T1: 预生成替换（即将死亡的关键 Creep）===
@@ -1438,9 +1497,8 @@ const SpawnManager = {
       queue.push({ role: "repairer", priority: 2, reason: "damaged" });
     } else { Memory._lastRoadCount = 0; }
 
-    // 运输者补充 — 动态上限：不超过采集者×2，避免 1 采 3 运的浪费
-    const maxHaulers = Math.min(P.MAX_HAULERS, Math.max(1, (c("harvester") + c("staticHarvester")) * 2));
-    if (c("hauler") < maxHaulers) {
+    // 运输者补充
+    if (c("hauler") < P.MAX_HAULERS) {
       queue.push({ role: "hauler", priority: 3, reason: "fill_hauler" });
     }
     // 城墙维修（RCL 3+）
@@ -1460,32 +1518,6 @@ const SpawnManager = {
       }
       if (c("remoteHauler") < P.MAX_REMOTE_HAULERS) {
         queue.push({ role: "remoteHauler", priority: 2, reason: "remote_haul" });
-      }
-    }
-
-    // === T3b: 远程定点矿工（src_* Flag，独立于 remote_* 系统）===
-    // 能量保护：本地能量充裕时才派矿工，避免影响主房间经济
-    const es = cache.energyCapacityAvailable > 0
-      ? cache.energyAvailable / cache.energyCapacityAvailable : 0;
-    const storageEnergy = cache.storage ? cache.storage.store[RESOURCE_ENERGY] : 0;
-    const canAffordRemote = es >= 0.7 || storageEnergy >= 5000;
-
-    if (canAffordRemote && c("remoteMiner") < P.MAX_REMOTE_MINERS) {
-      const srcFlags = _.filter(Game.flags, f => f.name.startsWith("src_"));
-      for (const flag of srcFlags) {
-        // 避免重复：已有分配到此 Flag 的矿工（含正在孵化的）
-        const assigned = _.some(Game.creeps, c =>
-          c.memory.role === CONFIG.ROLES.REMOTE_MINER && c.memory.flagName === flag.name
-        );
-        if (assigned) continue;
-
-        queue.push({
-          role: CONFIG.ROLES.REMOTE_MINER,
-          priority: 1,
-          reason: "remote_src",
-          flagName: flag.name,
-        });
-        Logger.info("孵化", `📍 远程矿点 ${flag.name}`, `房间:${flag.pos.roomName}`);
       }
     }
 
@@ -1516,13 +1548,18 @@ const SpawnManager = {
     const available = spawn.room.energyAvailable;
     const capacity = spawn.room.energyCapacityAvailable;
     const hasPendingP0 = queue.some(q => q.priority <= 0);
+    const hasPendingP1 = queue.some(q => q.priority === 1);
 
     for (let i = 0; i < queue.length; i++) {
       const item = queue[i];
 
-      // 能量保留：仅当仍有 P0（最低需求）项等待时才保留能量
-      // P0 全部满足后，P3+ 填充项不做保留，避免能量被锁死导致 Spawn 空转
-      const reserve = (item.priority >= 2 && hasPendingP0) ? CONFIG.SPAWN.ENERGY_RESERVE : 0;
+      // P0 = 最低生存需求(采集者/升级者)。只要还有 P0 没被满足，其余角色一律不许动能量。
+      // 原来只是"保留 300"，建造者照样能在能量充裕时抢先孵化；等采集者老死时
+      // Spawn 已被榨干，凑不出复活所需的 200 → 房间永久死锁
+      if (hasPendingP0 && item.priority > 0) continue;
+
+      // 其次：预生成替换(P1)未完成前，填充类角色要给它留够能量
+      const reserve = (item.priority >= 2 && hasPendingP1) ? CONFIG.SPAWN.ENERGY_RESERVE : 0;
       const usable = Math.max(available - reserve, 0);
 
       // 1. 尝试满容量身体
@@ -1534,8 +1571,9 @@ const SpawnManager = {
         cost = BodyBuilder.cost(body);
       }
       if (cost > usable) {
-        // 3. 缩水后还不够 → 紧急保底 [WORK, CARRY, MOVE]
-        const fallback = [WORK, CARRY, MOVE];
+        // 3. 缩水后还不够 → 按角色的最小可用身体保底
+        //    (不能一律用 [WORK,CARRY,MOVE]：那样孵出来的 claimer 没有 CLAIM 部件)
+        const fallback = BodyBuilder.minBody(item.role);
         const fbCost = BodyBuilder.cost(fallback);
         if (fbCost <= usable) {
           body = fallback;
@@ -1548,7 +1586,7 @@ const SpawnManager = {
       }
 
       queue.splice(i, 1);
-      return { role: item.role, body, cost, flagName: item.flagName };
+      return { role: item.role, body, cost, reason: item.reason };
     }
     return null;
   },
@@ -1557,35 +1595,69 @@ const SpawnManager = {
    * 执行孵化
    */
   _executeSpawn(spawn, item, counts) {
-    const { role, body, cost } = item;
-    const maxKey = `MAX_${role.toUpperCase()}S`;
-    const max = CONFIG.POPULATION[maxKey];
-    if (max !== undefined && (counts[role] || 0) >= max) return false;
+    const { role, body, cost, reason } = item;
+    const max = CONFIG.POPULATION[this.MAX_KEYS[role]];
+    // 预生成是给"即将死亡的 Creep"顶班的，此刻旧 Creep 还活着并占着名额，
+    // 用原上限一卡，满编角色的预生成就永远排不进来 → 允许临时 +1
+    const limit = (max !== undefined && reason === "pre_spawn") ? max + 1 : max;
+    if (limit !== undefined && (counts[role] || 0) >= limit) return false;
 
-    const baseMemory = { role, state: STATES.HARVESTING, homeRoom: Helpers.getHomeRoom() };
-    if (item.flagName) baseMemory.flagName = item.flagName;
+    const memory = this._initialMemory(role);
+    if (!memory) return false;   // 远程角色没有目标房间 → 别浪费能量
 
     const name = Helpers.genName(role);
-    const result = spawn.spawnCreep(body, name, { memory: baseMemory });
+    let result = spawn.spawnCreep(body, name, { memory });
+
+    if (result === ERR_NOT_ENOUGH_ENERGY) {
+      // 保底身体同样要按角色区分
+      const fallback = BodyBuilder.minBody(role);
+      const fbCost = BodyBuilder.cost(fallback);
+      if (fbCost <= spawn.room.energyAvailable) {
+        result = spawn.spawnCreep(fallback, name, { memory });
+        if (result === OK)
+          Logger.warn("孵化", `🐣 紧急${this._label(role)}"${name}"`, `保底:${fbCost}`);
+      }
+    }
 
     if (result === OK) {
+      // 计数就地 +1：多 Spawn 同 tick 孵化时，不更新会双双越过人口上限
+      counts[role] = (counts[role] || 0) + 1;
       Logger.info("孵化", `🐣 ${this._label(role)}"${name}"`,
         `部件:${body.length} | 成本:${cost} | 能量:${spawn.room.energyAvailable}/${spawn.room.energyCapacityAvailable}`);
       Notifier.onCreepSpawned();
       return true;
     }
-    if (result === ERR_NOT_ENOUGH_ENERGY) {
-      const fallback = [WORK, CARRY, MOVE];
-      const fbCost = BodyBuilder.cost(fallback);
-      if (fbCost <= spawn.room.energyAvailable) {
-        const fbName = Helpers.genName(role);
-        if (spawn.spawnCreep(fallback, fbName, { memory: baseMemory }) === OK) {
-          Logger.warn("孵化", `🐣 紧急${this._label(role)}"${fbName}"`, `保底:${fbCost}`);
-          return true;
-        }
-      }
-    }
     return false;
+  },
+
+  /** 初始 Memory —— 远程角色必须带上 targetRoom，否则孵出来就是废人 */
+  _initialMemory(role) {
+    const memory = { role, state: STATES.HARVESTING, homeRoom: Helpers.getHomeRoom() };
+    if (role === CONFIG.ROLES.CLAIMER || role === CONFIG.ROLES.REMOTE_HAULER) {
+      const targetRoom = this._pickRemoteRoom(role);
+      if (!targetRoom) return null;
+      memory.targetRoom = targetRoom;
+    }
+    return memory;
+  },
+
+  /** 挑一个远程房间：Claimer 挑最快到期的，RemoteHauler 挑人最少的 */
+  _pickRemoteRoom(role) {
+    if (!Memory.remoteRooms) return null;
+    const names = Object.keys(Memory.remoteRooms);
+    if (!names.length) return null;
+
+    if (role === CONFIG.ROLES.CLAIMER)
+      return _.min(names, rn => Memory.remoteRooms[rn].reservedUntil || 0);
+
+    const load = {};
+    for (const rn of names) load[rn] = 0;
+    for (const cn in Game.creeps) {
+      const m = Game.creeps[cn].memory;
+      if (m.role === role && m.targetRoom && load[m.targetRoom] !== undefined)
+        load[m.targetRoom]++;
+    }
+    return _.min(names, rn => load[rn]);
   },
 
   _needMoreHarv(counts, cache) {
@@ -1602,8 +1674,9 @@ const SpawnManager = {
       if (h + sh >= maxAtSources) return false;
     }
 
-    // 硬保底：必须有至少 1 个采集者。不用比例（会被 hauler 数量污染导致误判）
-    return h + sh < 1;
+    const total = _.sum(Object.values(counts));
+    if (total > 0 && (h + sh) / total < 0.25) return true;
+    return h < 1;
   },
 
   _label(r) {
@@ -1691,9 +1764,10 @@ const LinkManager = {
     if (!cache || cache.rcl < CONFIG.LINKS.ENABLED_AT_RCL) return;
     if (!cache.links || cache.links.length < 2) return;
 
-    const srcLinks = this._findSourceLinks(cache);
     const ctrlLink = this._findControllerLink(cache);
-    if (!srcLinks.length || !ctrlLink) return;
+    if (!ctrlLink) return;
+    const srcLinks = this._findSourceLinks(cache, ctrlLink);
+    if (!srcLinks.length) return;
 
     for (const src of srcLinks) {
       if (src.cooldown > 0) continue;
@@ -1704,9 +1778,12 @@ const LinkManager = {
     }
   },
 
-  _findSourceLinks(cache) {
+  _findSourceLinks(cache, ctrlLink) {
     const R = CONFIG.LINKS.SOURCE_RANGE;
+    // 必须排除 Controller Link 自己：Source 和 Controller 挨得近时它会同时命中两边，
+    // 于是出现 link.transferEnergy(自己) 这种必然失败的调用
     return cache.links.filter(link =>
+      (!ctrlLink || link.id !== ctrlLink.id) &&
       cache.sources.some(src => src.pos.getRangeTo(link.pos) <= R)
     );
   },
@@ -1727,9 +1804,12 @@ const MarketManager = {
     if (!cache.terminal || !cache.storage) return;
     if (cache.terminal.cooldown > 0) return;
 
-    // 节流: 每 TRADE_INTERVAL tick 交易一次
+    // 节流: 每 TRADE_INTERVAL tick 扫一次市场
+    // 关键是这里就要记账，而不是等成交才记 —— 否则一旦没有合适订单，
+    // 每个 tick 都会调用 Game.market.getAllOrders()，这是全脚本最贵的一个 API
     if (!Memory._lastTradeTick) Memory._lastTradeTick = 0;
     if (Game.time - Memory._lastTradeTick < CONFIG.MARKET.TRADE_INTERVAL) return;
+    Memory._lastTradeTick = Game.time;
 
     this._buyEnergy(cache, homeRoom);
     this._sellMinerals(cache, homeRoom);
@@ -1757,27 +1837,33 @@ const MarketManager = {
 
     const result = Game.market.deal(best.id, M.ENERGY_BUY_AMOUNT, homeRoom);
     if (result === OK) {
-      Memory._lastTradeTick = Game.time;
       Logger.info("市场", `💰 买入 ${M.ENERGY_BUY_AMOUNT} 能量`, `单价:${best.price.toFixed(3)}`);
       this._recordTrade("buy_energy", RESOURCE_ENERGY, best.price, M.ENERGY_BUY_AMOUNT);
+    } else {
+      Logger.debug("市场", "买入失败", `code:${result}`);
     }
   },
 
   _sellMinerals(cache, homeRoom) {
     const M = CONFIG.MARKET;
+    const storage = cache.storage, terminal = cache.terminal;
 
     // 检查 Storage 填充率
-    const totalStore = _.sum(cache.storage.store);
-    const fillRatio = totalStore / cache.storage.storeCapacity;
+    // storeCapacity 是已废弃属性，取到 undefined 会让 fillRatio 变 NaN，
+    // 而 `NaN < 阈值` 恒为 false —— 于是这道闸门形同虚设，永远放行
+    const capacity = storage.store.getCapacity();
+    if (!capacity) return;
+    const fillRatio = storage.store.getUsedCapacity() / capacity;
     if (fillRatio < M.STORAGE_SELL_THRESHOLD) return;
 
-    // 找出可卖矿物 (排除能量)
-    const minerals = Object.keys(cache.storage.store).filter(k =>
-      k !== RESOURCE_ENERGY && cache.storage.store[k] >= M.MINERAL_SELL_AMOUNT
+    // 只能卖 Terminal 里的货：Game.market.deal 是从 Terminal 发货的，
+    // 原实现按 Storage 库存挑货和算量，货没搬进 Terminal 时必定 ERR_NOT_ENOUGH_RESOURCES
+    const minerals = Object.keys(terminal.store).filter(k =>
+      k !== RESOURCE_ENERGY && terminal.store[k] >= 100
     );
     if (!minerals.length) return;
 
-    const mineral = minerals[0];
+    const mineral = _.max(minerals, k => terminal.store[k]);
     const orders = Game.market.getAllOrders(o =>
       o.resourceType === mineral &&
       o.type === ORDER_BUY &&
@@ -1786,12 +1872,14 @@ const MarketManager = {
     if (!orders.length) return;
 
     const best = _.max(orders, o => o.price);
-    const amount = Math.min(M.MINERAL_SELL_AMOUNT, best.amount, cache.storage.store[mineral]);
+    const amount = Math.min(M.MINERAL_SELL_AMOUNT, best.amount, terminal.store[mineral]);
+    if (amount <= 0) return;
     const result = Game.market.deal(best.id, amount, homeRoom);
     if (result === OK) {
-      Memory._lastTradeTick = Game.time;
       Logger.info("市场", `💎 卖出 ${amount} ${mineral}`, `单价:${best.price.toFixed(3)}`);
       this._recordTrade("sell", mineral, best.price, amount);
+    } else {
+      Logger.debug("市场", "卖出失败", `code:${result}`);
     }
   },
 
@@ -1952,22 +2040,32 @@ const LabManager = {
     for (const lab of cache.labs) {
       const compound = CONFIG.LABS.BOOST_COMPOUNDS.find(c => lab.mineralType === c);
       if (!compound || (lab.store[compound] || 0) < 30) continue;
+      if (lab.store[RESOURCE_ENERGY] < 20) continue;   // boostCreep 还要耗能量
 
-      // 找未强化的 upgrader
-      for (const creep of cache.myCreeps) {
-        if (creep.memory.role !== CONFIG.ROLES.UPGRADER) continue;
-        if (creep.memory._boosted) continue;
-        if (creep.pos.getRangeTo(lab.pos) > 1) {
-          creep.moveTo(lab, { reusePath: CONFIG.PATH.REUSE_TICKS, visualizePathStyle: { stroke: "#ff00ff" } });
-          continue;
-        }
-        const result = lab.boostCreep(creep);
-        if (result === OK) {
-          creep.memory._boosted = true;
-          Logger.info("实验室", `🧪 强化 ${creep.name}`, `化合物:${compound}`);
-        } else if (result === ERR_NOT_ENOUGH_RESOURCES) {
-          break; // 化合物不足
-        }
+      // 每个 Lab 每 tick 只招呼一个最近的未强化 Upgrader，
+      // 原实现对所有 Upgrader 挨个发 moveTo，等于让全体升级者集体罢工去排队
+      const candidates = cache.myCreeps.filter(c =>
+        c.memory.role === CONFIG.ROLES.UPGRADER && !c.memory._boosted &&
+        c.getActiveBodyparts(WORK) > 0
+      );
+      if (!candidates.length) continue;
+
+      const creep = lab.pos.findClosestByRange(candidates);
+      if (!creep) continue;
+
+      if (creep.pos.getRangeTo(lab.pos) > 1) {
+        // 用 Memory 标记而不是直接 moveTo：本管理器在 _runAllCreeps 之前/之后运行都可能
+        // 被角色自身的移动覆盖，交给 Upgrader 自己走过来才稳
+        creep.memory._boostLabId = lab.id;
+        continue;
+      }
+      const result = lab.boostCreep(creep);
+      if (result === OK) {
+        creep.memory._boosted = true;
+        delete creep.memory._boostLabId;
+        Logger.info("实验室", `🧪 强化 ${creep.name}`, `化合物:${compound}`);
+      } else if (result === ERR_NOT_ENOUGH_RESOURCES) {
+        delete creep.memory._boostLabId;
       }
     }
   },
@@ -1987,18 +2085,18 @@ const RoomManager = {
       ? cache.energyAvailable / cache.energyCapacityAvailable : 0;
 
     // 能量预警 + 低能邮件通知
+    // 必须是"持续"低于 15% 才发信：每次孵化都会把 energyAvailable 抽干，
+    // 原实现见低就报，等于把正常的孵化波谷当成告警
     if (es <= 0.15) {
+      if (!Memory._lowEnergySince) Memory._lowEnergySince = Game.time;
       if (!CPUGovernor.shouldSkipInfoLog() && Game.time % 100 === 0)
         Logger.warn("房间", `🔴 能量严重不足:${cache.energyAvailable}/${cache.energyCapacityAvailable}`);
-      if (CONFIG.NOTIFY.ON_LOW_ENERGY) Notifier.onLowEnergy(cache.energyAvailable, cache.energyCapacityAvailable);
-      // 重置恢复计时器
-      if (Memory._lowEnergyRecoveredAt) delete Memory._lowEnergyRecoveredAt;
+      if (CONFIG.NOTIFY.ON_LOW_ENERGY &&
+          Game.time - Memory._lowEnergySince >= CONFIG.NOTIFY.LOW_ENERGY_TICKS)
+        Notifier.onLowEnergy(cache.energyAvailable, cache.energyCapacityAvailable);
     } else {
-      // 持续恢复超过 500 tick 才清除通知标记，避免频繁抖动反复发邮件
-      if (!Memory._lowEnergyRecoveredAt) Memory._lowEnergyRecoveredAt = Game.time;
-      if (Game.time - Memory._lowEnergyRecoveredAt > 500) {
-        Notifier.onLowEnergyClear();
-      }
+      delete Memory._lowEnergySince;
+      Notifier.onLowEnergyClear();
     }
     if (es > 0.15 && es <= 0.3) {
       if (!CPUGovernor.shouldSkipInfoLog() && Game.time % 100 === 0)
@@ -2124,6 +2222,7 @@ const RoomManager = {
       const candidates = [];
       for (let dx = -1; dx <= 1; dx++) {
         for (let dy = -1; dy <= 1; dy++) {
+          if (dx === 0 && dy === 0) continue;   // Source 自己那格建不了东西
           const px = src.pos.x + dx, py = src.pos.y + dy;
           if (px < 1 || px > 48 || py < 1 || py > 48) continue;
           if (terrain.get(px, py) === TERRAIN_MASK_WALL) continue;
@@ -2134,8 +2233,14 @@ const RoomManager = {
         }
       }
       if (candidates.length > 0) {
-        room.createConstructionSite(candidates[0], STRUCTURE_CONTAINER);
-        Logger.info("建造", `📦 已放置 Source Container 工地 @(${src.pos.x},${src.pos.y})`);
+        // 挑离 Spawn 最近的一格，缩短搬运工往返距离
+        const spawn = cache.spawns[0];
+        const best = spawn
+          ? _.min(candidates, p => p.getRangeTo(spawn.pos))
+          : candidates[0];
+        // 检查返回值再打日志，否则失败时会每 tick 谎报一次"已放置"
+        if (room.createConstructionSite(best, STRUCTURE_CONTAINER) === OK)
+          Logger.info("建造", `📦 已放置 Source Container 工地 @(${best.x},${best.y})`);
       }
     }
   },
@@ -2425,11 +2530,10 @@ const Visuals = {
 
     // 角色
     const allCount = _.sum(Object.values(counts));
-    rows.push({ text: `👥 ${allCount}人   采:${totalHarv}  升:${counts.upgrader || 0}  建:${counts.builder || 0}  修:${counts.repairer || 0}  运:${counts.hauler || 0}  墙:${counts.wallRepairer || 0}  占:${counts.claimer || 0}  远:${counts.remoteHauler || 0}  矿:${counts.remoteMiner || 0}`, color: "#bbbbbb" });
+    rows.push({ text: `👥 ${allCount}人   采:${totalHarv}  升:${counts.upgrader || 0}  建:${counts.builder || 0}  修:${counts.repairer || 0}  运:${counts.hauler || 0}  墙:${counts.wallRepairer || 0}  占:${counts.claimer || 0}  远:${counts.remoteHauler || 0}`, color: "#bbbbbb" });
 
     // 底部状态
-    const remoteFlags = _.filter(Game.flags, f => f.name.startsWith("src_")).length;
-    rows.push({ text: `📦 ${containerEnergy + storageEnergy}  |  🏗 ${cache.sites.length}  |  🛡 ${cache.towers.length}  |  🏴 ${remoteFlags}  |  💾 ${Game.cpu.bucket}`, color: "#999999" });
+    rows.push({ text: `📦 ${containerEnergy + storageEnergy}  |  🏗 ${cache.sites.length}  |  🛡 ${cache.towers.length}  |  💾 ${Game.cpu.bucket}`, color: "#999999" });
 
     // 自适应背景
     const panelW = 18;
@@ -3049,18 +3153,28 @@ function _runAllCreeps() {
     wallRepairer:    WallRepairer,
     claimer:         Claimer,
     remoteHauler:    RemoteHauler,
-    remoteMiner:     RemoteMiner,
   };
+
+  const deadlock = {};   // roomName → bool，每 tick 每房间只判定一次
 
   for (const name in Game.creeps) {
     const creep = Game.creeps[name];
     const role  = creep.memory.role;
     if (!role) continue;
 
-    const mod = modules[role];
-    if (!mod) continue;
-
     try {
+      // ---- 采集者灭绝自救：优先于一切常规角色行为 ----
+      const rn = creep.room.name;
+      if (deadlock[rn] === undefined)
+        deadlock[rn] = Emergency.isDeadlocked(RoomCache.get(rn));
+
+      if (deadlock[rn] && !Harvester._isHarvestRole(role) && Emergency.canRescue(creep)) {
+        Emergency.run(creep, RoomCache.get(rn));
+        continue;
+      }
+
+      const mod = modules[role];
+      if (!mod) continue;
       mod.run(creep);
     } catch (e) {
       Logger.error("主循环", `💥 "${name}"(${role})崩溃`, { msg: e.message || e });
