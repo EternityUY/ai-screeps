@@ -1,6 +1,6 @@
 # AI Colony — 自主多智能体协调系统
 
-[![version](https://img.shields.io/badge/version-4.0.0-blue.svg)](main.js)
+[![version](https://img.shields.io/badge/version-4.0-blue.svg)](main.js)
 
 基于角色的自主多智能体协调系统，在可编程模拟环境中运行。系统通过中央控制循环协调多个专用智能体（Agent），实现资源采集、建造、运输、升级和防御的完整自动化流水线。
 
@@ -92,7 +92,7 @@
 
 ## Agent 类型
 
-| 角色 | 职责 | 启动阶段 |
+| Role | 职责 | 启动阶段 |
 |------|------|---------|
 | Harvester | 走动式采集，基础能量供应 | P1 |
 | StaticHarvester | 定点采集，存入容器 | P2 |
@@ -101,8 +101,8 @@
 | Builder | 按优先级建造建筑 | P1 |
 | Repairer | 维修道路和容器 | P1 |
 | WallRepairer | 维修城墙和路障 | P3 |
-| Claimer | 占领新区（预留） | P5 |
-| RemoteHarvester | 远征采集（预留） | P5 |
+| Claimer | 远征预定/续约 Controller | P5 |
+| RemoteHauler | 跨房间搬运能量回基地 | P5 |
 
 ---
 
